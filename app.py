@@ -920,7 +920,7 @@ with tab5:
                     color=mc["sharpe"],
                     colorscale="Viridis",
                     showscale=True,
-                    colorbar=dict(title="SHARPE", titlefont=dict(size=10)),
+                    colorbar=dict(title=dict(text="SHARPE", font=dict(size=10))),
                     opacity=0.6,
                 ),
                 name="Simulations",
