@@ -83,48 +83,15 @@ def fetch_prices(tickers, start="2021-01-01"):
 # TOOL 2: FUNDAMENTALS (Robust 3-layer fetching)
 # ============================================================
 
-# Hardcoded sector map for Brazilian tickers (when YF returns empty)
-SECTOR_MAP = {
-    "PETR4.SA": "Energy", "PRIO3.SA": "Energy", "PETR3.SA": "Energy",
-    "VALE3.SA": "Basic Materials", "SUZB3.SA": "Basic Materials",
-    "KLBN11.SA": "Basic Materials", "CSNA3.SA": "Basic Materials",
-    "USIM5.SA": "Basic Materials", "GGBR4.SA": "Basic Materials",
-    "ITUB4.SA": "Financial Services", "BBDC4.SA": "Financial Services",
-    "SANB11.SA": "Financial Services", "BBAS3.SA": "Financial Services",
-    "BPAC11.SA": "Financial Services", "ABCB4.SA": "Financial Services",
-    "B3SA3.SA": "Financial Services", "ITSA4.SA": "Financial Services",
-    "EGIE3.SA": "Utilities", "CMIG4.SA": "Utilities",
-    "EQTL3.SA": "Utilities", "ELET3.SA": "Utilities",
-    "ELET6.SA": "Utilities", "SBSP3.SA": "Utilities",
-    "TAEE11.SA": "Utilities", "CPFE3.SA": "Utilities",
-    "ABEV3.SA": "Consumer Defensive", "JBSS3.SA": "Consumer Defensive",
-    "MRFG3.SA": "Consumer Defensive", "BRFS3.SA": "Consumer Defensive",
-    "NTCO3.SA": "Consumer Defensive",
-    "WEGE3.SA": "Industrials", "EMBR3.SA": "Industrials",
-    "RAIL3.SA": "Industrials", "AZUL4.SA": "Industrials",
-    "GOLL4.SA": "Industrials", "CCRO3.SA": "Industrials",
-    "MGLU3.SA": "Consumer Cyclical", "LREN3.SA": "Consumer Cyclical",
-    "RENT3.SA": "Consumer Cyclical", "VIIA3.SA": "Consumer Cyclical",
-    "AMER3.SA": "Consumer Cyclical",
-    "RDOR3.SA": "Healthcare", "HAPV3.SA": "Healthcare",
-    "QUAL3.SA": "Healthcare", "FLRY3.SA": "Healthcare",
-    "VIVT3.SA": "Communication Services", "TIMS3.SA": "Communication Services",
-}
-
-NAME_MAP = {
-    "PETR4.SA": "Petrobras PN", "PETR3.SA": "Petrobras ON",
-    "PRIO3.SA": "PRIO", "VALE3.SA": "Vale",
-    "ITUB4.SA": "Itau Unibanco", "BBDC4.SA": "Bradesco",
-    "SANB11.SA": "Santander BR", "BBAS3.SA": "Banco do Brasil",
-    "BPAC11.SA": "BTG Pactual", "ABCB4.SA": "Banco ABC",
-    "EGIE3.SA": "Engie Brasil", "CMIG4.SA": "Cemig",
-    "EQTL3.SA": "Equatorial", "WEGE3.SA": "WEG",
-    "ABEV3.SA": "Ambev", "SUZB3.SA": "Suzano",
-    "B3SA3.SA": "B3", "ITSA4.SA": "Itausa",
-    "RENT3.SA": "Localiza", "RDOR3.SA": "Rede DOr",
-    "JBSS3.SA": "JBS", "ELET3.SA": "Eletrobras",
-    "RAIL3.SA": "Rumo", "EMBR3.SA": "Embraer",
-}
+# Sector/Name maps from b3_universe (single source of truth)
+try:
+    from b3_universe import B3_UNIVERSE
+    SECTOR_MAP = {t: s for t, (_, s) in B3_UNIVERSE.items()}
+    NAME_MAP = {t: n for t, (n, _) in B3_UNIVERSE.items()}
+except ImportError:
+    # Fallback if b3_universe not available
+    SECTOR_MAP = {}
+    NAME_MAP = {}
 
 
 def _empty_row(ticker):
@@ -242,24 +209,53 @@ def fetch_fundamentals(tickers, prices_df=None):
 # TOOL 3: ML WALK-FORWARD + CLUSTERING
 # ============================================================
 
-def run_ml(prices):
-    """Random Forest walk-forward for 12m return prediction + KMeans clustering."""
+def run_ml(prices, fund_df=None):
+    """
+    Random Forest walk-forward for 12m return prediction + KMeans clustering.
+
+    If fund_df is provided, merges fundamental features (P/L, P/VP, ROE, margin, growth)
+    so the model can learn relationships beyond pure technicals. This is critical
+    for stocks with strong fundamentals but weak momentum (e.g. quality banks).
+    """
     feat = prices.copy()
     feat["month"] = feat["data"].dt.to_period("M")
     me = feat.sort_values("data").groupby(["ticker", "month"]).tail(1).copy()
     me = me.sort_values(["ticker", "data"])
 
+    # Market features
     mkt = ["vol_21", "mom_6m", "mom_12m", "drawdown"]
     for c in mkt:
         me[f"{c}_z"] = me.groupby("data")[c].transform(
             lambda s: (s - s.mean()) / (s.std() if s.std() > 0 else 1))
     mkt_z = [f"{c}_z" for c in mkt]
 
+    # Fundamental features (merged from fund_df if provided)
+    fund_cols = []
+    if fund_df is not None and not fund_df.empty:
+        fund_feats = ["P_L", "P_VP", "returnOnEquity", "profitMargins",
+                      "revenueGrowth", "ebitdaMargins", "debtToEquity"]
+        fund_avail = [c for c in fund_feats if c in fund_df.columns]
+        if fund_avail:
+            me = me.merge(fund_df[["ticker"] + fund_avail], on="ticker", how="left")
+            # Cross-sectional z-scores for fundamentals (per date)
+            for c in fund_avail:
+                me[f"{c}_z"] = me.groupby("data")[c].transform(
+                    lambda s: (s - s.mean()) / (s.std() if s.std() > 0 else 1))
+                # Fill NaN with 0 (sector neutral)
+                me[f"{c}_z"] = me[f"{c}_z"].fillna(0)
+            fund_cols = [f"{c}_z" for c in fund_avail]
+
     me["ret_12m_fwd"] = me.groupby("ticker")["preco"].transform(
         lambda s: s.shift(-12) / s - 1.0)
 
-    core = mkt + mkt_z
-    data_ml = me.dropna(subset=core + ["ret_12m_fwd"]).copy()
+    # Combined feature set: market + fundamental
+    core = mkt + mkt_z + fund_cols
+    data_ml = me.dropna(subset=mkt + mkt_z + ["ret_12m_fwd"]).copy()
+    if fund_cols:
+        # Don't drop on fund_cols (we filled with 0), but ensure they exist
+        for c in fund_cols:
+            if c not in data_ml.columns:
+                data_ml[c] = 0
     data_ml["year"] = data_ml["data"].dt.year
 
     yrs = sorted(data_ml["year"].unique())
@@ -289,9 +285,16 @@ def run_ml(prices):
     fi_df = pd.concat(fis, axis=1).T if fis else pd.DataFrame()
 
     # Final model for predictions
-    latest = me.dropna(subset=core).sort_values("data").groupby("ticker").tail(1).copy()
+    # For final prediction, only require market features (fundamentals already filled with 0)
+    latest = me.dropna(subset=mkt + mkt_z).sort_values("data").groupby("ticker").tail(1).copy()
+    # Ensure fund cols exist (fill with 0 if missing)
+    for c in fund_cols:
+        if c not in latest.columns:
+            latest[c] = 0
+        else:
+            latest[c] = latest[c].fillna(0)
     if len(data_ml) >= 20:
-        train_all = data_ml.dropna(subset=core + ["ret_12m_fwd"])
+        train_all = data_ml.dropna(subset=mkt + mkt_z + ["ret_12m_fwd"])
         mfin = RandomForestRegressor(
             n_estimators=400, max_depth=6, min_samples_leaf=3,
             random_state=42, n_jobs=-1)
