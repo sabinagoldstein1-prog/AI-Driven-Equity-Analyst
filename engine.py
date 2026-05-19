@@ -188,6 +188,63 @@ def fetch_fundamentals(tickers, prices_df=None):
             except Exception:
                 pass
 
+        # ===== Layer 4: Compute multiples from raw financials =====
+        # If P/L, P/VP or EV/EBITDA still missing, calculate from financial statements
+        needs_pl = pd.isna(r["P_L"])
+        needs_pvp = pd.isna(r["P_VP"])
+        needs_ev = pd.isna(r["EV_EBITDA"])
+        needs_roe = pd.isna(r["returnOnEquity"])
+
+        if (needs_pl or needs_pvp or needs_ev or needs_roe) and pd.notna(r["marketCap"]):
+            try:
+                tk = yf.Ticker(t)
+                # Get financial statements
+                fin = tk.financials  # income statement
+                bs = tk.balance_sheet
+                # Net Income (TTM)
+                net_income = np.nan
+                if fin is not None and not fin.empty:
+                    for key in ["Net Income", "Net Income Common Stockholders",
+                                "Net Income Continuous Operations"]:
+                        if key in fin.index:
+                            net_income = to_float(fin.loc[key].iloc[0])
+                            if pd.notna(net_income):
+                                break
+                # Book Value (Total Equity)
+                book_value = np.nan
+                if bs is not None and not bs.empty:
+                    for key in ["Stockholders Equity", "Total Equity Gross Minority Interest",
+                                "Common Stock Equity"]:
+                        if key in bs.index:
+                            book_value = to_float(bs.loc[key].iloc[0])
+                            if pd.notna(book_value):
+                                break
+                # EBITDA
+                ebitda = np.nan
+                if fin is not None and not fin.empty:
+                    if "EBITDA" in fin.index:
+                        ebitda = to_float(fin.loc["EBITDA"].iloc[0])
+                    elif "Normalized EBITDA" in fin.index:
+                        ebitda = to_float(fin.loc["Normalized EBITDA"].iloc[0])
+
+                # Compute multiples
+                if needs_pl and pd.notna(net_income) and net_income > 0:
+                    r["P_L"] = safe_div(r["marketCap"], net_income)
+                if needs_pvp and pd.notna(book_value) and book_value > 0:
+                    r["P_VP"] = safe_div(r["marketCap"], book_value)
+                if needs_ev and pd.notna(ebitda) and ebitda > 0 and pd.notna(r["EV"]):
+                    r["EV_EBITDA"] = safe_div(r["EV"], ebitda)
+                if needs_roe and pd.notna(net_income) and pd.notna(book_value) and book_value > 0:
+                    r["returnOnEquity"] = safe_div(net_income, book_value)
+                # Profit margin fallback
+                if pd.isna(r["profitMargins"]) and pd.notna(net_income):
+                    if "Total Revenue" in fin.index:
+                        revenue = to_float(fin.loc["Total Revenue"].iloc[0])
+                        if pd.notna(revenue) and revenue > 0:
+                            r["profitMargins"] = safe_div(net_income, revenue)
+            except Exception:
+                pass
+
         # Derived
         r["lucro"] = safe_div(r["marketCap"], r["P_L"])
         r["pl_equity"] = safe_div(r["marketCap"], r["P_VP"])
@@ -195,6 +252,9 @@ def fetch_fundamentals(tickers, prices_df=None):
         # EV/EBITDA fallback for banks (use EV/Lucro)
         if pd.isna(r["EV_EBITDA"]) and pd.notna(r["EV"]) and pd.notna(r["lucro"]) and r["lucro"] > 0:
             r["EV_EBITDA"] = safe_div(r["EV"], r["lucro"])
+
+        # P/L fallback using lucro derived from P_VP (rare)
+        # If P_L missing but we have marketCap and reasonable price, leave as NaN
 
         rows.append(r)
 
